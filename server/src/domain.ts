@@ -85,13 +85,18 @@ export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' |
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
 }
-export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
-export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
+export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; emit('appointment', 'upsert', id, item); if (container) emit('container', 'upsert', container.id, container); auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
+export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; emit('task', 'upsert', id, task); auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
 export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
 
 export type ContainerInput = Omit<Container, 'lastEvent' | 'appointmentId'> & { appointmentId?: string };
 export type AppointmentInput = Pick<GateAppointment, 'containerId' | 'truckNo' | 'driver' | 'type' | 'windowStart' | 'windowEnd' | 'lane'>;
 export type TaskInput = Pick<YardTask, 'kind' | 'containerId' | 'from' | 'to' | 'priority' | 'scheduledAt' | 'estimatedMinutes'> & { equipmentId?: string };
+
+export type DomainEmitter = (entity: string, action: 'upsert' | 'delete', entityId: string, data?: unknown) => void;
+let domainEmitter: DomainEmitter | undefined;
+export function setDomainEmitter(emitter: DomainEmitter) { domainEmitter = emitter; }
+function emit(entity: string, action: 'upsert' | 'delete', entityId: string, data?: unknown) { domainEmitter?.(entity, action, entityId, data); }
 
 function recordAudit(action: string, entity: string, entityId: string, details: string) {
   auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action, entity, entityId, at: new Date().toISOString(), details });
@@ -111,6 +116,7 @@ export function createContainer(input: ContainerInput) {
   }
   const item: Container = { ...input, id, lastEvent: `人工建档 ${new Date().toLocaleString()}` };
   containers.unshift(item);
+  emit('container', 'upsert', item.id, item);
   recordAudit('CREATE', 'container', item.id, '新增集装箱台账记录');
   return item;
 }
@@ -124,6 +130,7 @@ export function updateContainer(id: string, patch: Partial<Omit<Container, 'id' 
   if (blockId && !blocks.some(block => block.id === blockId)) throw new Error('堆位所属区块不存在');
   if (next.hazmatClass && blockId && !blocks.find(block => block.id === blockId)?.hazmatAllowed) throw new Error('危险品不能进入当前堆场区块');
   Object.assign(item, patch, { lastEvent: `台账更新 ${new Date().toLocaleString()}` });
+  emit('container', 'upsert', id, item);
   recordAudit('UPDATE', 'container', id, '更新集装箱台账字段');
   return item;
 }
@@ -136,6 +143,9 @@ export function deleteContainer(id: string) {
   for (const appointment of removedAppointments) appointments.splice(appointments.indexOf(appointment), 1);
   const removedTasks = tasks.filter(task => task.containerId === id);
   for (const task of removedTasks) tasks.splice(tasks.indexOf(task), 1);
+  emit('container', 'delete', id);
+  for (const appointment of removedAppointments) emit('appointment', 'delete', appointment.id);
+  for (const task of removedTasks) emit('task', 'delete', task.id);
   recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${removedTasks.length} 条未完成任务`);
   return item;
 }
@@ -148,6 +158,8 @@ export function createGateAppointment(input: AppointmentInput) {
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false };
   appointments.unshift(item);
   container.appointmentId = item.id;
+  emit('appointment', 'upsert', item.id, item);
+  emit('container', 'upsert', container.id, container);
   recordAudit('CREATE', 'appointment', item.id, `为 ${item.containerId} 创建闸口预约`);
   return item;
 }
@@ -164,6 +176,9 @@ export function editGateAppointment(id: string, patch: Partial<AppointmentInput 
   if (nextContainer) nextContainer.appointmentId = id;
   if (item.status === 'checked-in' && nextContainer) nextContainer.status = 'at-gate';
   if (item.status === 'completed' && nextContainer) nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
+  emit('appointment', 'upsert', id, item);
+  if (previousContainer && previousContainer.id !== nextContainer?.id) emit('container', 'upsert', previousContainer.id, previousContainer);
+  if (nextContainer) emit('container', 'upsert', nextContainer.id, nextContainer);
   recordAudit('UPDATE', 'appointment', id, `更新预约状态/时隙：${JSON.stringify(patch)}`);
   return item;
 }
@@ -174,6 +189,8 @@ export function deleteGateAppointment(id: string) {
   const [item] = appointments.splice(index, 1);
   const container = containers.find(entry => entry.id === item.containerId);
   if (container?.appointmentId === id) container.appointmentId = undefined;
+  emit('appointment', 'delete', id);
+  if (container) emit('container', 'upsert', container.id, container);
   recordAudit('DELETE', 'appointment', id, `取消并删除 ${item.containerId} 的闸口预约`);
   return item;
 }
@@ -184,6 +201,7 @@ export function createYardTask(input: TaskInput) {
   if (input.estimatedMinutes <= 0) throw new Error('预计作业时长必须大于 0');
   const item: YardTask = { ...input, id: `TASK-${Date.now()}`, status: input.equipmentId ? 'assigned' : 'queued', blockingReasons: [], scheduledAt: input.scheduledAt };
   tasks.unshift(item);
+  emit('task', 'upsert', item.id, item);
   recordAudit('CREATE', 'yard-task', item.id, `创建 ${input.kind} 任务，关联 ${input.containerId}`);
   return item;
 }
@@ -194,6 +212,7 @@ export function updateYardTask(id: string, patch: Partial<TaskInput & Pick<YardT
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('关联箱号不存在');
   if (patch.priority !== undefined && (patch.priority < 1 || patch.priority > 100)) throw new Error('优先级范围为 1–100');
   Object.assign(item, patch);
+  emit('task', 'upsert', id, item);
   recordAudit('UPDATE', 'yard-task', id, `更新场内作业任务：${JSON.stringify(patch)}`);
   return item;
 }
@@ -202,6 +221,7 @@ export function deleteYardTask(id: string) {
   const index = tasks.findIndex(item => item.id === id);
   if (index < 0) return undefined;
   const [item] = tasks.splice(index, 1);
+  emit('task', 'delete', id);
   recordAudit('DELETE', 'yard-task', id, `删除 ${item.containerId} 的场内任务`);
   return item;
 }
