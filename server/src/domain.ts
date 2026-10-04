@@ -1,3 +1,5 @@
+import { opsBus, type Module } from './events.js';
+
 export type ContainerStatus = 'in-transit' | 'at-gate' | 'in-yard' | 'on-quay' | 'released' | 'hold';
 export type EquipmentKind = 'quay-crane' | 'yard-crane' | 'terminal-truck' | 'reach-stacker';
 export type TaskStatus = 'queued' | 'assigned' | 'executing' | 'blocked' | 'done';
@@ -68,7 +70,8 @@ export function gateConflicts() {
   appointments.filter(a => a.status === 'booked').forEach(a => { const container = containers.find(c => c.id === a.containerId); if (container?.customs !== 'released') result.push({ severity: 'warning', appointmentId: a.id, reason: `箱 ${a.containerId} 海关状态为 ${container?.customs}，无法无条件放行` }); });
   return result;
 }
-export function yardHeatmap() { return blocks.map(block => ({ ...block, utilization: block.occupied / block.capacity, freeSlots: block.capacity - block.occupied, pressure: block.heat > 85 ? 'critical' : block.heat > 65 ? 'warning' : 'normal' })); }
+export function blockHeatRow(block: YardBlock) { return { ...block, utilization: block.occupied / block.capacity, freeSlots: block.capacity - block.occupied, pressure: block.heat > 85 ? 'critical' : block.heat > 65 ? 'warning' : 'normal' }; }
+export function yardHeatmap() { return blocks.map(blockHeatRow); }
 export function containerPlan(containerId: string) {
   const container = containers.find(c => c.id === containerId); if (!container) return undefined;
   const reasons: string[] = []; const candidates = blocks.filter(block => block.capacity > block.occupied && (!container.hazmatClass || block.hazmatAllowed) && (!container.reefer || block.reeferPlugs > block.usedPlugs));
@@ -79,14 +82,15 @@ export function containerPlan(containerId: string) {
   if (container.hazmatClass) reasons.push(`危险品 ${container.hazmatClass} 级，只能进入有隔离资质的区块`);
   return { container, recommendedBlock: selected, alternatives: ranked.slice(1, 3).map(item => item.block), reasons };
 }
-export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) })).sort((a, b) => b.score - a.score); }
+export function taskWithScore(task: YardTask) { return { ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) }; }
+export function prioritizeTasks() { return tasks.map(taskWithScore).sort((a, b) => b.score - a.score); }
 export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
   const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
 }
 export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
-export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
+export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); publishTask(task, 'updated'); return task; }
 export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
 
 export type ContainerInput = Omit<Container, 'lastEvent' | 'appointmentId'> & { appointmentId?: string };
@@ -95,6 +99,47 @@ export type TaskInput = Pick<YardTask, 'kind' | 'containerId' | 'from' | 'to' | 
 
 function recordAudit(action: string, entity: string, entityId: string, details: string) {
   auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action, entity, entityId, at: new Date().toISOString(), details });
+}
+
+/** 统一事件发布：实体事件携带完整实体（删除仅带 id），任务附带优先级得分 */
+function publishContainer(item: Container, action: 'created' | 'updated' | 'deleted') {
+  opsBus.publish('containers', `container.${action}`, action === 'deleted' ? { id: item.id } : item, item.id);
+}
+function publishAppointment(item: GateAppointment, action: 'created' | 'updated' | 'deleted') {
+  opsBus.publish('gate', `appointment.${action}`, action === 'deleted' ? { id: item.id } : item, item.id);
+}
+function publishTask(item: YardTask, action: 'created' | 'updated' | 'deleted') {
+  opsBus.publish('tasks', `task.${action}`, action === 'deleted' ? { id: item.id } : taskWithScore(item), item.id);
+}
+
+export interface OpsAlert { id: string; severity: 'critical' | 'warning'; module: Module; entityId: string; message: string; }
+
+/** 跨模块实时告警：闸口冲突、冷藏温控、任务阻塞、危险品扣留、设备不可用 */
+export function operationalAlerts(): OpsAlert[] {
+  const alerts: OpsAlert[] = [];
+  for (const conflict of gateConflicts()) alerts.push({ id: `gate-${conflict.appointmentId}-${conflict.severity}`, severity: conflict.severity, module: 'gate', entityId: conflict.appointmentId, message: conflict.reason });
+  for (const container of containers.filter(item => item.reefer && ((item.temperature ?? 0) > 5 || item.customs === 'inspection'))) {
+    const overheated = (container.temperature ?? 0) > 5;
+    alerts.push({ id: `reefer-${container.id}-${overheated ? 'temp' : 'customs'}`, severity: overheated ? 'critical' : 'warning', module: 'containers', entityId: container.id, message: overheated ? `冷藏箱 ${container.id} 温度 ${container.temperature}°C 超阈值` : `冷藏箱 ${container.id} 待海关查验，持续占用冷插位` });
+  }
+  for (const task of tasks.filter(item => item.status === 'blocked')) alerts.push({ id: `task-${task.id}`, severity: 'critical', module: 'tasks', entityId: task.id, message: `任务 ${task.id} 阻塞：${task.blockingReasons[0] ?? '原因待确认'}` });
+  for (const container of containers.filter(item => item.hazmatClass && item.customs !== 'released')) alerts.push({ id: `hazmat-${container.id}`, severity: 'warning', module: 'containers', entityId: container.id, message: `危险品箱 ${container.id} 海关未放行（${container.customs}）` });
+  for (const machine of equipment.filter(item => item.status === 'maintenance' || item.status === 'offline')) alerts.push({ id: `equip-${machine.id}`, severity: machine.status === 'offline' ? 'critical' : 'warning', module: 'equipment', entityId: machine.id, message: `设备 ${machine.name} ${machine.status === 'offline' ? '离线' : '维护中'}` });
+  return alerts;
+}
+
+/** 按订阅模块构建初始快照，键名与前端状态切片一一对应 */
+export function snapshotModules(modules: ReadonlySet<Module>): Record<string, unknown> {
+  const snapshot: Record<string, unknown> = {};
+  if (modules.has('dashboard')) snapshot.dashboard = dashboard();
+  if (modules.has('voyages')) snapshot.voyages = voyages;
+  if (modules.has('containers')) snapshot.containers = containers;
+  if (modules.has('yard')) snapshot.yard = yardHeatmap();
+  if (modules.has('gate')) { snapshot.appointments = appointments; snapshot.conflicts = gateConflicts(); }
+  if (modules.has('tasks')) snapshot.tasks = prioritizeTasks();
+  if (modules.has('equipment')) snapshot.equipment = equipment;
+  if (modules.has('alerts')) snapshot.alerts = operationalAlerts();
+  return snapshot;
 }
 
 export function createContainer(input: ContainerInput) {
@@ -112,6 +157,7 @@ export function createContainer(input: ContainerInput) {
   const item: Container = { ...input, id, lastEvent: `人工建档 ${new Date().toLocaleString()}` };
   containers.unshift(item);
   recordAudit('CREATE', 'container', item.id, '新增集装箱台账记录');
+  publishContainer(item, 'created');
   return item;
 }
 
@@ -125,6 +171,7 @@ export function updateContainer(id: string, patch: Partial<Omit<Container, 'id' 
   if (next.hazmatClass && blockId && !blocks.find(block => block.id === blockId)?.hazmatAllowed) throw new Error('危险品不能进入当前堆场区块');
   Object.assign(item, patch, { lastEvent: `台账更新 ${new Date().toLocaleString()}` });
   recordAudit('UPDATE', 'container', id, '更新集装箱台账字段');
+  publishContainer(item, 'updated');
   return item;
 }
 
@@ -137,6 +184,9 @@ export function deleteContainer(id: string) {
   const removedTasks = tasks.filter(task => task.containerId === id);
   for (const task of removedTasks) tasks.splice(tasks.indexOf(task), 1);
   recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${removedTasks.length} 条未完成任务`);
+  publishContainer(item, 'deleted');
+  for (const appointment of removedAppointments) publishAppointment(appointment, 'deleted');
+  for (const task of removedTasks) publishTask(task, 'deleted');
   return item;
 }
 
@@ -149,6 +199,8 @@ export function createGateAppointment(input: AppointmentInput) {
   appointments.unshift(item);
   container.appointmentId = item.id;
   recordAudit('CREATE', 'appointment', item.id, `为 ${item.containerId} 创建闸口预约`);
+  publishAppointment(item, 'created');
+  publishContainer(container, 'updated');
   return item;
 }
 
@@ -165,6 +217,9 @@ export function editGateAppointment(id: string, patch: Partial<AppointmentInput 
   if (item.status === 'checked-in' && nextContainer) nextContainer.status = 'at-gate';
   if (item.status === 'completed' && nextContainer) nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
   recordAudit('UPDATE', 'appointment', id, `更新预约状态/时隙：${JSON.stringify(patch)}`);
+  publishAppointment(item, 'updated');
+  if (previousContainer) publishContainer(previousContainer, 'updated');
+  if (nextContainer && nextContainer.id !== previousContainer?.id) publishContainer(nextContainer, 'updated');
   return item;
 }
 
@@ -175,6 +230,8 @@ export function deleteGateAppointment(id: string) {
   const container = containers.find(entry => entry.id === item.containerId);
   if (container?.appointmentId === id) container.appointmentId = undefined;
   recordAudit('DELETE', 'appointment', id, `取消并删除 ${item.containerId} 的闸口预约`);
+  publishAppointment(item, 'deleted');
+  if (container) publishContainer(container, 'updated');
   return item;
 }
 
@@ -185,6 +242,7 @@ export function createYardTask(input: TaskInput) {
   const item: YardTask = { ...input, id: `TASK-${Date.now()}`, status: input.equipmentId ? 'assigned' : 'queued', blockingReasons: [], scheduledAt: input.scheduledAt };
   tasks.unshift(item);
   recordAudit('CREATE', 'yard-task', item.id, `创建 ${input.kind} 任务，关联 ${input.containerId}`);
+  publishTask(item, 'created');
   return item;
 }
 
@@ -195,6 +253,7 @@ export function updateYardTask(id: string, patch: Partial<TaskInput & Pick<YardT
   if (patch.priority !== undefined && (patch.priority < 1 || patch.priority > 100)) throw new Error('优先级范围为 1–100');
   Object.assign(item, patch);
   recordAudit('UPDATE', 'yard-task', id, `更新场内作业任务：${JSON.stringify(patch)}`);
+  publishTask(item, 'updated');
   return item;
 }
 
@@ -203,5 +262,6 @@ export function deleteYardTask(id: string) {
   if (index < 0) return undefined;
   const [item] = tasks.splice(index, 1);
   recordAudit('DELETE', 'yard-task', id, `删除 ${item.containerId} 的场内任务`);
+  publishTask(item, 'deleted');
   return item;
 }

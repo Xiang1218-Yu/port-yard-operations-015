@@ -1,6 +1,40 @@
 import express from 'express';
-import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, operationalAlerts, prioritizeTasks, snapshotModules, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { opsBus, StreamHub } from './events.js';
+import { startTelemetry } from './telemetry.js';
+
 const app = express(); app.use(express.json());
+
+// 实时事件流：统一事件格式 + 游标回放 + 按模块订阅
+const hub = new StreamHub(opsBus, snapshotModules);
+hub.start();
+
+// 派生视图扇出：实体变更合并触发一次 dashboard/闸口冲突/告警刷新，避免级联写放大
+const derivedDirty = new Set<'dashboard' | 'conflicts' | 'alerts'>();
+let derivedTimer: ReturnType<typeof setTimeout> | undefined;
+opsBus.subscribe(event => {
+  if (event.module === 'dashboard' || event.module === 'alerts' || event.type === 'gate.conflicts') return;
+  if (event.module !== 'equipment') derivedDirty.add('dashboard');
+  derivedDirty.add('alerts');
+  if (event.module === 'gate' || event.module === 'containers') derivedDirty.add('conflicts');
+  derivedTimer ??= setTimeout(() => {
+    derivedTimer = undefined;
+    if (derivedDirty.delete('dashboard')) opsBus.publish('dashboard', 'dashboard.updated', dashboard());
+    if (derivedDirty.delete('conflicts')) opsBus.publish('gate', 'gate.conflicts', gateConflicts());
+    if (derivedDirty.delete('alerts')) opsBus.publish('alerts', 'alerts.updated', operationalAlerts());
+  }, 50);
+});
+
+startTelemetry();
+
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  const connectionId = hub.attach(res, {
+    modules: typeof req.query.modules === 'string' ? req.query.modules : undefined,
+    lastEventId: typeof req.query.lastEventId === 'string' ? req.query.lastEventId : req.header('Last-Event-ID'),
+  });
+  req.on('close', () => hub.detach(connectionId));
+});
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
 app.get('/api/containers', (req, res) => res.json(req.query.status ? containers.filter(c => c.status === req.query.status) : containers));
